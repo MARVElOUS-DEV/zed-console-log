@@ -33,7 +33,7 @@ jobs:
           else
             shasum -a 256 "zed-console-log-${{ runner.os }}-${{ runner.arch }}.tar.gz" > SHA256SUMS
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zed-console-log-${{ runner.os }}-${{ runner.arch }}
           path: |
@@ -48,7 +48,7 @@ jobs:
         with:
           targets: wasm32-wasip2
       - run: cargo build -p zed-console-log-extension --target wasm32-wasip2 --release --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zed-console-log-extension-wasm
           path: |

@@ -1,0 +1,14 @@
+[package]
+publish = false
+name = "zed-console-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Syntax-aware logging language server for JavaScript and TypeScript"
+
+[dependencies]
+zed-console-log-core = { path = "../core" }
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+serde_json.workspace = true

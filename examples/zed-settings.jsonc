@@ -1,0 +1,23 @@
+{
+  "languages": {
+    "JavaScript": { "language_servers": ["zed-console-log", "..."] },
+    "TypeScript": { "language_servers": ["zed-console-log", "..."] },
+    "TSX": { "language_servers": ["zed-console-log", "..."] }
+  },
+  "lsp": {
+    "zed-console-log": {
+      "binary": {
+        "path": "/absolute/path/to/zed-console-log/target/release/zed-console-log",
+        "arguments": ["--stdio"]
+      },
+      "settings": {
+        "prefix": "ZCL",
+        "methods": ["log", "info", "debug", "warn", "error", "table"],
+        "includeFileName": true,
+        "includeLineNumber": true,
+        "insertPosition": "below",
+        "customFunction": null
+      }
+    }
+  }
+}

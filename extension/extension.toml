@@ -1,0 +1,15 @@
+id = "zed-console-log-lsp"
+name = "Console Log LSP"
+version = "0.1.0"
+schema_version = 1
+authors = ["zed-console-log contributors"]
+description = "Syntax-aware debug logging code actions for JavaScript and TypeScript"
+
+[language_servers.zed-console-log]
+name = "Console Log"
+languages = ["JavaScript", "TypeScript", "TSX"]
+
+[language_servers.zed-console-log.language_ids]
+JavaScript = "javascript"
+TypeScript = "typescript"
+TSX = "typescriptreact"

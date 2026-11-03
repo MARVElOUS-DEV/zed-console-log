@@ -1,7 +1,11 @@
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
+    fs,
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -14,6 +18,7 @@ struct Client {
     input: ChildStdin,
     output: Receiver<Value>,
     id: u64,
+    pending: VecDeque<Value>,
 }
 
 impl Drop for Client {
@@ -68,6 +73,7 @@ impl Client {
             input,
             output,
             id: 0,
+            pending: VecDeque::new(),
         }
     }
 
@@ -114,13 +120,14 @@ impl Client {
                 .output
                 .recv_timeout(Duration::from_secs(10))
                 .expect("server response timed out");
-            if message["id"] == id {
+            if message.get("method").is_none() && message["id"] == id {
                 return message;
             }
             assert!(
-                message.get("id").is_none(),
-                "unexpected server request: {message}"
+                message.get("id").is_none() || message.get("method").is_some(),
+                "unexpected response: {message}"
             );
+            self.pending.push_back(message);
         }
     }
 
@@ -220,7 +227,11 @@ fn apply(source: &str, action: &Value, version: i32) -> String {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0]["textDocument"]["uri"], URI);
     assert_eq!(changes[0]["textDocument"]["version"], version);
-    let mut edits: Vec<_> = changes[0]["edits"]
+    apply_edits(source, &changes[0]["edits"])
+}
+
+fn apply_edits(source: &str, edits: &Value) -> String {
+    let mut edits: Vec<_> = edits
         .as_array()
         .unwrap()
         .iter()
@@ -835,4 +846,537 @@ fn typeof_operands_require_a_resolved_identifier() {
     let actions = client.actions(selection, &[]);
     apply(source, find(&actions, "Insert console.log"), 1);
     client.finish();
+}
+
+struct Workspace(PathBuf);
+impl Workspace {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zed-console-log-{}-{unique}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self(path.canonicalize().unwrap())
+    }
+
+    fn uri(&self, relative: &str) -> String {
+        url::Url::from_file_path(self.0.join(relative))
+            .unwrap()
+            .to_string()
+    }
+
+    fn write(&self, relative: &str, source: &str) -> String {
+        let path = self.0.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+        self.uri(relative)
+    }
+}
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+impl Client {
+    fn workspace(roots: &[&Path]) -> Self {
+        Self::workspace_options(json!({
+            "workspaceFolders": roots.iter().map(|root| json!({
+                "uri": url::Url::from_file_path(root).unwrap().to_string(), "name": "test"
+            })).collect::<Vec<_>>(),
+            "capabilities": { "workspace": { "applyEdit": true, "workspaceEdit": { "documentChanges": true } } }
+        }))
+    }
+
+    fn workspace_options(options: Value) -> Self {
+        let mut client = Self::spawn();
+        let response = client.request("initialize", options);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            response["result"]["capabilities"]["executeCommandProvider"]["commands"],
+            json!(["zedConsoleLog.deleteWorkspace"])
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["workspace"]["workspaceFolders"]["supported"],
+            true
+        );
+        client.notify("initialized", json!({}));
+        client
+    }
+
+    fn open_uri(&mut self, uri: &str, source: &str, language: &str, version: i32) {
+        self.notify(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": language, "version": version, "text": source
+            }}),
+        );
+    }
+
+    fn workspace_actions(&mut self, uri: &str, range: Value, only: &[&str]) -> Vec<Value> {
+        self.request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri }, "range": range,
+                "context": { "diagnostics": [], "only": only }
+            }),
+        )["result"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn begin_cleanup(&mut self) {
+        let response = self.request(
+            "workspace/executeCommand",
+            json!({ "command": "zedConsoleLog.deleteWorkspace" }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    fn wait_message(&mut self, method: &str) -> Value {
+        loop {
+            let message = self.pending.pop_front().unwrap_or_else(|| {
+                self.output
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("server message timed out")
+            });
+            if message["method"] == method {
+                return message;
+            }
+            assert!(
+                message.get("id").is_none(),
+                "unexpected request while waiting for {method}: {message}"
+            );
+        }
+    }
+
+    fn respond(&mut self, request: &Value, result: Value) {
+        self.send(json!({ "jsonrpc": "2.0", "id": request["id"], "result": result }));
+    }
+}
+
+const OWNED: &str = "const value = 1;\n/* zed-console-log */ console.log('owned', value);\n";
+
+#[test]
+fn workspace_cleanup_previews_counts_and_edits_unsaved_and_closed_files() {
+    let workspace = Workspace::new();
+    let open_uri = workspace.write("open café.ts", OWNED);
+    let unsaved = "const café = '😀';\r\n/* zed-console-log */ console.log('unsaved', café);\r\nconsole.log('application', café);\r\n";
+    let closed = "const value = 1;\n/* zed-console-log */ console.log(\n  'multiline',\n  value\n);\n// /* zed-console-log */ console.log('disabled', value);\nconsole.log('application', value);\nconst text = \"/* zed-console-log */ console.log('fake', value);\";\n";
+    let closed_uri = workspace.write("nested/closed.tsx", closed);
+    let clean_uri = workspace.write("clean.ts", "console.log('application');\n");
+    let mut client = Client::workspace(&[&workspace.0]);
+    client.open_uri(&open_uri, unsaved, "typescript", 7);
+    let actions = client.workspace_actions(
+        &open_uri,
+        caret(),
+        &["source.zedConsoleLog.deleteWorkspace"],
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["title"], "Delete generated logs in workspace…");
+    assert_eq!(
+        actions[0]["command"]["command"],
+        "zedConsoleLog.deleteWorkspace"
+    );
+    assert!(actions[0].get("edit").is_none());
+    client.begin_cleanup();
+    let preview = client.wait_message("window/showMessageRequest");
+    let message = preview["params"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Delete 3 generated logs in 2 files?"),
+        "{message}"
+    );
+    assert!(message.contains("open café.ts — 1 log"));
+    assert!(message.contains("closed.tsx — 2 logs"));
+    assert!(!message.contains("clean.ts"));
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("open café.ts")).unwrap(),
+        OWNED
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("nested/closed.tsx")).unwrap(),
+        closed
+    );
+    client.respond(&preview, json!({ "title": "Delete logs" }));
+    let request = client.wait_message("workspace/applyEdit");
+    let changes = request["params"]["edit"]["documentChanges"]
+        .as_array()
+        .unwrap();
+    assert_eq!(changes.len(), 2);
+    for change in changes {
+        if change["textDocument"]["uri"] == open_uri {
+            assert_eq!(change["textDocument"]["version"], 7);
+            assert_eq!(
+                apply_edits(unsaved, &change["edits"]),
+                "const café = '😀';\r\nconsole.log('application', café);\r\n"
+            );
+        } else {
+            assert_eq!(change["textDocument"]["uri"], closed_uri);
+            assert!(change["textDocument"]["version"].is_null());
+            let updated = apply_edits(closed, &change["edits"]);
+            assert!(!updated.contains("'multiline'"));
+            assert!(!updated.contains("'disabled'"));
+            assert!(updated.contains("console.log('application', value);"));
+            assert!(updated.contains("'fake'"));
+        }
+        assert_ne!(change["textDocument"]["uri"], clean_uri);
+    }
+    client.respond(&request, json!({ "applied": true }));
+    let result = client.wait_message("window/showMessage");
+    assert!(
+        result["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Removed 3 generated logs from 2 files")
+    );
+    // The server never writes directly, even when the client accepts the edits.
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("open café.ts")).unwrap(),
+        OWNED
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("nested/closed.tsx")).unwrap(),
+        closed
+    );
+    client.finish();
+}
+
+#[test]
+fn workspace_cleanup_respects_ignore_rules_generated_directories_and_safety_checks() {
+    let workspace = Workspace::new();
+    workspace.write(".gitignore", "ignored/\n*.generated.ts\n");
+    workspace.write(".ignore", "local-only/\n");
+    workspace.write("nested/.gitignore", "skip.ts\n");
+    for relative in [
+        "ignored/file.ts",
+        "local-only/file.ts",
+        "a.generated.ts",
+        "nested/skip.ts",
+        "node_modules/pkg/file.js",
+        "dist/file.js",
+        "target/file.ts",
+        "build/file.ts",
+        "coverage/file.ts",
+        ".next/file.ts",
+        "vendor/file.ts",
+        "not-code.txt",
+    ] {
+        workspace.write(relative, OWNED);
+    }
+    workspace.write(
+        "broken.ts",
+        "const value = ;\n/* zed-console-log */ console.log('owned', value);\n",
+    );
+    workspace.write("asi.js", "console.log('application')\n/* zed-console-log */ console.log('owned', value);\n[1].forEach(run)\n");
+    workspace.write("oversized.ts", &" ".repeat(4 * 1024 * 1024 + 1));
+    let valid = workspace.write(".hidden/valid.mts", OWNED);
+    let mut client = Client::workspace(&[&workspace.0]);
+    // Ignored open buffers must not bypass ignore rules.
+    client.open_uri(&workspace.uri("ignored/file.ts"), OWNED, "typescript", 1);
+    client.begin_cleanup();
+    let preview = client.wait_message("window/showMessageRequest");
+    let message = preview["params"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Delete 1 generated log in 1 file?"),
+        "{message}"
+    );
+    assert!(message.contains("3 files/entries skipped"), "{message}");
+    assert!(!message.contains("ignored/file.ts"));
+    client.respond(&preview, json!({ "title": "Delete logs" }));
+    let apply = client.wait_message("workspace/applyEdit");
+    assert_eq!(
+        apply["params"]["edit"]["documentChanges"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        apply["params"]["edit"]["documentChanges"][0]["textDocument"]["uri"],
+        valid
+    );
+    client.respond(&apply, json!({ "applied": true }));
+    client.wait_message("window/showMessage");
+    client.finish();
+}
+
+#[test]
+fn workspace_cleanup_cancel_or_dismiss_never_requests_edits() {
+    for choice in [Value::Null, json!({ "title": "Cancel" })] {
+        let workspace = Workspace::new();
+        workspace.write("value.ts", OWNED);
+        let mut client = Client::workspace(&[&workspace.0]);
+        client.begin_cleanup();
+        let preview = client.wait_message("window/showMessageRequest");
+        // The ordered protocol loop remains responsive while the prompt is open.
+        let duplicate = client.request(
+            "workspace/executeCommand",
+            json!({ "command": "zedConsoleLog.deleteWorkspace" }),
+        );
+        assert_eq!(duplicate["error"]["code"], -32602);
+        client.respond(&preview, choice);
+        let result = client.wait_message("window/showMessage");
+        assert_eq!(result["params"]["message"], "Workspace cleanup canceled.");
+        assert_eq!(
+            fs::read_to_string(workspace.0.join("value.ts")).unwrap(),
+            OWNED
+        );
+        client.finish();
+    }
+}
+
+#[test]
+fn workspace_cleanup_rejects_changed_previews_instead_of_applying_stale_edits() {
+    for change in ["disk", "buffer", "folder", "open"] {
+        let workspace = Workspace::new();
+        let uri = workspace.write("value.ts", OWNED);
+        let mut client = Client::workspace(&[&workspace.0]);
+        if change == "buffer" {
+            client.open_uri(&uri, OWNED, "typescript", 1);
+        }
+        client.begin_cleanup();
+        let preview = client.wait_message("window/showMessageRequest");
+        match change {
+            "disk" => { workspace.write("value.ts", "const value = 2;\n"); }
+            "buffer" => client.notify("textDocument/didChange", json!({ "textDocument": { "uri": uri, "version": 2 }, "contentChanges": [{ "text": "const value = 2;\n" }] })),
+            "folder" => client.notify("workspace/didChangeWorkspaceFolders", json!({ "event": { "added": [], "removed": [{ "uri": workspace.uri(""), "name": "test" }] } })),
+            "open" => client.open_uri(&uri, "const value = 2;\n", "typescript", 1),
+            _ => unreachable!(),
+        }
+        // Reply immediately: queued notifications must be drained before validation.
+        client.respond(&preview, json!({ "title": "Delete logs" }));
+        let result = client.wait_message("window/showMessage");
+        assert!(
+            result["params"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("changed"),
+            "{result}"
+        );
+        client.finish();
+    }
+}
+
+#[test]
+fn workspace_cleanup_never_falls_back_to_disk_for_invalid_open_buffers() {
+    let workspace = Workspace::new();
+    let uri = workspace.write("value.ts", OWNED);
+    let mut client = Client::workspace(&[&workspace.0]);
+    client.open_uri(&uri, OWNED, "typescript", 1);
+    client.notify("textDocument/didChange", json!({
+        "textDocument": { "uri": uri, "version": 2 },
+        "contentChanges": [{ "range": { "start": { "line": 500, "character": 0 }, "end": { "line": 500, "character": 1 } }, "text": "invalid" }]
+    }));
+    client.begin_cleanup();
+    let result = client.wait_message("window/showMessage");
+    assert!(
+        result["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("No safely removable generated logs found. 1 files/entries skipped.")
+    );
+    client.finish();
+}
+
+#[test]
+fn workspace_cleanup_tracks_multiple_folders_and_deduplicates_nested_roots() {
+    let first = Workspace::new();
+    let second = Workspace::new();
+    let outside = Workspace::new();
+    first.write("value.ts", OWNED);
+    first.write("nested/value.ts", OWNED);
+    second.write("value.cts", OWNED);
+    let outside_uri = outside.write("value.ts", OWNED);
+    let nested = first.0.join("nested");
+    let mut client = Client::workspace(&[&first.0, &nested, &outside.0]);
+    client.notify(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": {
+            "added": [{ "uri": second.uri(""), "name": "second" }],
+            "removed": [{ "uri": outside.uri(""), "name": "outside" }]
+        }}),
+    );
+    client.open_uri(&outside_uri, OWNED, "typescript", 1);
+    assert!(
+        client
+            .workspace_actions(
+                &outside_uri,
+                caret(),
+                &["source.zedConsoleLog.deleteWorkspace"]
+            )
+            .is_empty()
+    );
+    client.begin_cleanup();
+    let preview = client.wait_message("window/showMessageRequest");
+    assert!(
+        preview["params"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Delete 3 generated logs in 3 files?")
+    );
+    client.respond(&preview, json!({ "title": "Cancel" }));
+    client.wait_message("window/showMessage");
+    client.finish();
+}
+
+#[test]
+fn workspace_cleanup_requires_client_capabilities_and_never_replaces_document_cleanup() {
+    let workspace = Workspace::new();
+    let uri = workspace.write("value.ts", OWNED);
+    let mut client = Client::workspace_options(json!({
+        "rootUri": workspace.uri(""),
+        "capabilities": { "workspace": { "applyEdit": true, "workspaceEdit": { "documentChanges": true } } }
+    }));
+    client.open_uri(&uri, OWNED, "typescript", 1);
+    assert_eq!(
+        client
+            .workspace_actions(&uri, caret(), &["source.zedConsoleLog.deleteWorkspace"])
+            .len(),
+        1
+    );
+    let document = client.workspace_actions(&uri, caret(), &["source.zedConsoleLog.delete"]);
+    assert_eq!(document.len(), 1);
+    assert!(document[0].get("edit").is_some());
+    assert!(
+        client
+            .workspace_actions(
+                &uri,
+                range(OWNED, "value", true),
+                &["source.zedConsoleLog.deleteWorkspace"]
+            )
+            .is_empty()
+    );
+    let unknown = client.request(
+        "workspace/executeCommand",
+        json!({ "command": "untrusted", "arguments": ["/outside"] }),
+    );
+    assert_eq!(unknown["error"]["code"], -32602);
+    client.finish();
+    for workspace_options in [
+        json!({}),
+        json!({ "applyEdit": true }),
+        json!({ "workspaceEdit": { "documentChanges": true } }),
+    ] {
+        let mut client = Client::workspace_options(
+            json!({ "rootUri": workspace.uri(""), "capabilities": { "workspace": workspace_options } }),
+        );
+        client.open_uri(&uri, OWNED, "typescript", 1);
+        assert!(
+            client
+                .workspace_actions(&uri, caret(), &["source.zedConsoleLog.deleteWorkspace"])
+                .is_empty()
+        );
+        let response = client.request(
+            "workspace/executeCommand",
+            json!({ "command": "zedConsoleLog.deleteWorkspace" }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+        client.finish();
+    }
+}
+
+#[test]
+fn workspace_cleanup_reports_editor_rejection_without_writing_files() {
+    let workspace = Workspace::new();
+    workspace.write("value.ts", OWNED);
+    let mut client = Client::workspace(&[&workspace.0]);
+    client.begin_cleanup();
+    let preview = client.wait_message("window/showMessageRequest");
+    client.respond(&preview, json!({ "title": "Delete logs" }));
+    let apply = client.wait_message("workspace/applyEdit");
+    client.respond(
+        &apply,
+        json!({ "applied": false, "failureReason": "version mismatch" }),
+    );
+    let result = client.wait_message("window/showMessage");
+    assert!(
+        result["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("version mismatch")
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("value.ts")).unwrap(),
+        OWNED
+    );
+    client.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_cleanup_does_not_follow_symlinks() {
+    let workspace = Workspace::new();
+    let outside = Workspace::new();
+    outside.write("outside.ts", OWNED);
+    std::os::unix::fs::symlink(outside.0.join("outside.ts"), workspace.0.join("link.ts")).unwrap();
+    std::os::unix::fs::symlink(&outside.0, workspace.0.join("linked-dir")).unwrap();
+    let uri = workspace.write("valid.ts", OWNED);
+    workspace.write("aliased.ts", OWNED);
+    std::os::unix::fs::symlink(
+        workspace.0.join("aliased.ts"),
+        workspace.0.join("internal-link.ts"),
+    )
+    .unwrap();
+    let mut client = Client::workspace(&[&workspace.0]);
+    client.open_uri(&workspace.uri("internal-link.ts"), OWNED, "typescript", 1);
+    client.open_uri(&workspace.uri("link.ts"), OWNED, "typescript", 1);
+    client.begin_cleanup();
+    let preview = client.wait_message("window/showMessageRequest");
+    assert!(
+        preview["params"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Delete 1 generated log in 1 file?")
+    );
+    client.respond(&preview, json!({ "title": "Delete logs" }));
+    let apply = client.wait_message("workspace/applyEdit");
+    assert_eq!(
+        apply["params"]["edit"]["documentChanges"][0]["textDocument"]["uri"],
+        uri
+    );
+    assert_eq!(
+        apply["params"]["edit"]["documentChanges"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    client.respond(&apply, json!({ "applied": true }));
+    client.wait_message("window/showMessage");
+    client.finish();
+}
+
+#[test]
+fn workspace_cleanup_rejects_missing_or_non_file_workspace_roots() {
+    let workspace = Workspace::new();
+    let uri = workspace.write("value.ts", OWNED);
+    // Non-file schemes must never be interpreted as filesystem paths.
+    for root in [
+        Value::Null,
+        json!(format!("https://example.com{}", workspace.0.display())),
+    ] {
+        let mut client = Client::workspace_options(json!({
+            "rootUri": root,
+            "capabilities": { "workspace": { "applyEdit": true, "workspaceEdit": { "documentChanges": true } } }
+        }));
+        client.open_uri(&uri, OWNED, "typescript", 1);
+        assert!(
+            client
+                .workspace_actions(&uri, caret(), &["source.zedConsoleLog.deleteWorkspace"])
+                .is_empty()
+        );
+        let response = client.request(
+            "workspace/executeCommand",
+            json!({ "command": "zedConsoleLog.deleteWorkspace" }),
+        );
+        assert_eq!(response["error"]["code"], -32602);
+        client.finish();
+    }
 }

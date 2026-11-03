@@ -8,7 +8,10 @@ license.workspace = true
 description = "Syntax-aware logging language server for JavaScript and TypeScript"
 
 [dependencies]
+ignore = "0.4"
 zed-console-log-core = { path = "../core" }
 tower-lsp-server = "0.23"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+tower-service = "0.3"
+url = "2"
 serde_json.workspace = true

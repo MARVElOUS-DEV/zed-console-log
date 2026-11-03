@@ -1357,11 +1357,13 @@ fn workspace_cleanup_does_not_follow_symlinks() {
 fn workspace_cleanup_rejects_missing_or_non_file_workspace_roots() {
     let workspace = Workspace::new();
     let uri = workspace.write("value.ts", OWNED);
+    // Use a URL path so Windows drive letters and backslashes form a valid URI.
+    let remote_root = format!(
+        "https://example.com{}",
+        url::Url::from_file_path(&workspace.0).unwrap().path()
+    );
     // Non-file schemes must never be interpreted as filesystem paths.
-    for root in [
-        Value::Null,
-        json!(format!("https://example.com{}", workspace.0.display())),
-    ] {
+    for root in [Value::Null, json!(remote_root)] {
         let mut client = Client::workspace_options(json!({
             "rootUri": root,
             "capabilities": { "workspace": { "applyEdit": true, "workspaceEdit": { "documentChanges": true } } }

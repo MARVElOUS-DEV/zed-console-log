@@ -1,0 +1,56 @@
+name: Build development artifacts
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            exe: ""
+          - os: macos-latest
+            exe: ""
+          - os: windows-latest
+            exe: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked -p zed-console-log
+      - name: Package executable and documentation
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/release/zed-console-log${{ matrix.exe }}" README.md LICENSE CHANGELOG.md staging/
+          tar -czf "zed-console-log-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C staging .
+          if command -v sha256sum >/dev/null; then
+            sha256sum "zed-console-log-${{ runner.os }}-${{ runner.arch }}.tar.gz" > SHA256SUMS
+          else
+            shasum -a 256 "zed-console-log-${{ runner.os }}-${{ runner.arch }}.tar.gz" > SHA256SUMS
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-console-log-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            zed-console-log-*.tar.gz
+            SHA256SUMS
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - run: cargo build -p zed-console-log-extension --target wasm32-wasip2 --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-console-log-extension-wasm
+          path: |
+            target/wasm32-wasip2/release/zed_console_log_extension.wasm
+            extension/extension.toml

@@ -1,0 +1,8 @@
+/target/
+/extension/target/
+/extension/extension.wasm
+node_modules/
+dist/
+*.tgz
+.DS_Store
+.env

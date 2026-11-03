@@ -6,10 +6,6 @@
   },
   "lsp": {
     "zed-console-log": {
-      "binary": {
-        "path": "/absolute/path/to/zed-console-log/target/release/zed-console-log",
-        "arguments": ["--stdio"]
-      },
       "settings": {
         "prefix": "ZCL",
         "methods": ["log", "info", "debug", "warn", "error", "table"],

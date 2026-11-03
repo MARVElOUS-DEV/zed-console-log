@@ -15,7 +15,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo test --locked
+      - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   format-and-wasm:
@@ -27,6 +27,11 @@ jobs:
           components: rustfmt
           targets: wasm32-wasip2
       - run: cargo fmt --all -- --check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tools/release.py validate
+      - run: python -m unittest discover -s tools -p 'test_*.py'
       - run: cargo build -p zed-console-log-extension --target wasm32-wasip2 --release --locked
 
   msrv:

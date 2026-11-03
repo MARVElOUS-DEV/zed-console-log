@@ -1,7 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod cleanup;
+mod ordered;
+
 use serde_json::Value;
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use tower_lsp_server::{
     Client, LanguageServer, LspService, Server,
     jsonrpc::{Error, Result},
@@ -16,15 +23,22 @@ struct Document {
     version: i32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     settings: Settings,
     documents: HashMap<Uri, Document>,
+    invalid_documents: HashSet<Uri>,
+    roots: HashMap<Uri, PathBuf>,
+    can_apply_edit: bool,
+    cleanup_running: bool,
+    revision: u64,
+    active: bool,
 }
 
 struct Backend {
     client: Client,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    queue: Arc<ordered::Queue>,
 }
 
 fn core_position(position: Position) -> text::Position {
@@ -52,7 +66,33 @@ impl LanguageServer for Backend {
             params.initialization_options.unwrap_or(Value::Null),
         ))
         .map_err(Error::invalid_params)?;
-        self.state.lock().expect("state poisoned").settings = settings;
+        {
+            let mut state = self.state.lock().expect("state poisoned");
+            state.settings = settings;
+            state.active = true;
+            state.can_apply_edit =
+                params
+                    .capabilities
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|workspace| {
+                        workspace.apply_edit == Some(true)
+                            && workspace
+                                .workspace_edit
+                                .as_ref()
+                                .is_some_and(|edit| edit.document_changes == Some(true))
+                    });
+            #[allow(deprecated)]
+            let folders = params
+                .workspace_folders
+                .map(|folders| folders.into_iter().map(|folder| folder.uri).collect())
+                .unwrap_or_else(|| params.root_uri.into_iter().collect::<Vec<_>>());
+            for uri in folders {
+                if let Some(path) = cleanup::root_path(&uri) {
+                    state.roots.insert(uri, path);
+                }
+            }
+        }
         Ok(InitializeResult {
             offset_encoding: None,
             server_info: Some(ServerInfo {
@@ -76,24 +116,43 @@ impl LanguageServer for Backend {
                             CodeActionKind::new("source.zedConsoleLog.uncomment"),
                             CodeActionKind::new("source.zedConsoleLog.delete"),
                             CodeActionKind::new("source.zedConsoleLog.correct"),
+                            CodeActionKind::new(cleanup::KIND),
                         ]),
                         resolve_provider: Some(false),
                         ..Default::default()
                     },
                 )),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![cleanup::COMMAND.into()],
+                    ..Default::default()
+                }),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
     }
 
     async fn shutdown(&self) -> Result<()> {
-        self.state.lock().expect("state poisoned").documents.clear();
+        let mut state = self.state.lock().expect("state poisoned");
+        state.active = false;
+        state.revision += 1;
+        state.documents.clear();
+        state.invalid_documents.clear();
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        self.state.lock().expect("state poisoned").documents.insert(
+        let mut state = self.state.lock().expect("state poisoned");
+        state.revision += 1;
+        state.invalid_documents.remove(&document.uri);
+        state.documents.insert(
             document.uri,
             Document {
                 text: document.text,
@@ -131,9 +190,11 @@ impl LanguageServer for Backend {
                     document.text = change.text;
                 }
             }
+            state.revision += 1;
             if invalid {
                 // Do not offer edits against a stale snapshot after a synchronization failure.
                 state.documents.remove(&uri);
+                state.invalid_documents.insert(uri);
                 Some("Invalid document change; close and reopen the buffer to resynchronize")
             } else {
                 document.version = params.text_document.version;
@@ -147,11 +208,10 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.state
-            .lock()
-            .expect("state poisoned")
-            .documents
-            .remove(&params.text_document.uri);
+        let mut state = self.state.lock().expect("state poisoned");
+        state.revision += 1;
+        state.documents.remove(&params.text_document.uri);
+        state.invalid_documents.remove(&params.text_document.uri);
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
@@ -169,13 +229,60 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let mut state = self.state.lock().expect("state poisoned");
+        state.revision += 1;
+        for folder in params.event.removed {
+            state.roots.remove(&folder.uri);
+        }
+        for folder in params.event.added {
+            if let Some(path) = cleanup::root_path(&folder.uri) {
+                state.roots.insert(folder.uri, path);
+            }
+        }
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
+        if params.command != cleanup::COMMAND || !params.arguments.is_empty() {
+            return Err(Error::invalid_params(
+                "Unknown command or unexpected arguments",
+            ));
+        }
+        let snapshot = {
+            let mut state = self.state.lock().expect("state poisoned");
+            if state.roots.is_empty() || !state.can_apply_edit {
+                return Err(Error::invalid_params(
+                    "Workspace cleanup requires a local workspace and versioned workspace-edit support",
+                ));
+            }
+            if state.cleanup_running {
+                return Err(Error::invalid_params(
+                    "A workspace cleanup is already in progress",
+                ));
+            }
+            state.cleanup_running = true;
+            state.clone()
+        };
+        // Do not block the ordered LSP loop while the user reviews the preview.
+        cleanup::start(
+            self.client.clone(),
+            self.state.clone(),
+            snapshot,
+            self.queue.clone(),
+        );
+        Ok(None)
+    }
+
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let (document, settings) = {
+        let (document, settings, workspace_cleanup) = {
             let state = self.state.lock().expect("state poisoned");
             let Some(document) = state.documents.get(&params.text_document.uri) else {
                 return Ok(Some(Vec::new()));
             };
-            (document.clone(), state.settings.clone())
+            let workspace_cleanup = state.can_apply_edit
+                && cleanup::contains_document(&state.roots, &params.text_document.uri)
+                && zed_console_log_core::actions::source_type(&document.language).is_some();
+            (document.clone(), state.settings.clone(), workspace_cleanup)
         };
         let start = text::offset(&document.text, core_position(params.range.start))
             .ok_or_else(|| Error::invalid_params("Invalid start position"))?;
@@ -229,6 +336,19 @@ impl LanguageServer for Backend {
                 ..Default::default()
             }));
         }
+        if workspace_cleanup && start == end && cleanup::matches_kind(&only) {
+            result.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: cleanup::TITLE.into(),
+                kind: Some(CodeActionKind::new(cleanup::KIND)),
+                is_preferred: Some(false),
+                command: Some(Command {
+                    title: cleanup::TITLE.into(),
+                    command: cleanup::COMMAND.into(),
+                    arguments: None,
+                }),
+                ..Default::default()
+            }));
+        }
         Ok(Some(result))
     }
 }
@@ -252,13 +372,18 @@ async fn main() {
             std::process::exit(2);
         }
     }
+    let queue = Arc::new(ordered::Queue::default());
     let (service, socket) = LspService::new(|client| Backend {
         client,
-        state: Mutex::new(State::default()),
+        state: Arc::new(Mutex::new(State::default())),
+        queue: queue.clone(),
     });
     // Preserve notification/request ordering, including incremental edits before code actions.
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket)
         .concurrency_level(1)
-        .serve(service)
+        .serve(ordered::Ordered {
+            inner: service,
+            queue,
+        })
         .await;
 }

@@ -7,6 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-oxc = { version = "=0.115.0", features = ["semantic", "ast_visit"] }
+oxc = { version = "=0.126.0", features = ["semantic", "ast_visit"] }
 serde.workspace = true
 serde_json.workspace = true

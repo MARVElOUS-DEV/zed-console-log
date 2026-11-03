@@ -26,10 +26,29 @@ cargo build -p zed-console-log-extension --target wasm32-wasip2 --release --lock
 
 ## Use in Zed
 
-1. Build the native server.
-2. Open Zed's Extensions view, choose **Install Dev Extension**, and select this repository's `extension/` directory. Zed builds its WebAssembly launcher.
-3. Merge [examples/zed-settings.jsonc](examples/zed-settings.jsonc) into your Zed settings, replacing the binary path with the absolute path to your executable. Keep `"..."` in each language-server list to retain your existing servers.
-4. Open a JS/TS/JSX/TSX buffer, put the caret on a variable or select a supported expression, and open the code actions menu.
+1. Once the registry submission is accepted, install **Console Log LSP** (`debug-log-lsp`) from Zed's Extensions view. During development, choose **Install Dev Extension** and select this repository's `extension/` directory instead.
+2. Merge [examples/zed-settings.jsonc](examples/zed-settings.jsonc) into your Zed settings. Keep `"..."` in each language-server list to retain your existing servers.
+3. Open a JS/TS/JSX/TSX buffer. The launcher downloads the matching native server from [GitHub Releases](https://github.com/MARVElOUS-DEV/zed-console-log/releases) when no local override or PATH binary is available. The release must be published before this first download can succeed.
+4. Put the caret on a variable or select a supported expression, and open the code actions menu.
+
+Automatic installation supports macOS, Linux, and Windows on x86-64 and ARM64. Linux archives use musl. The downloaded server is pinned to the extension version (`0.1.0` uses release `v0.1.0`) and cached in Zed's extension work directory, so later starts work offline. Updating the extension selects a new versioned cache. Downloads use a staging directory; failed or interrupted installations are retried on the next server start. Release archives contain the executable, README, changelog, and MIT license; checksums are published alongside them.
+
+For local development or a manually installed server, build the native executable and set an absolute override in your settings:
+
+```json
+{
+  "lsp": {
+    "zed-console-log": {
+      "binary": {
+        "path": "/absolute/path/to/zed-console-log/target/release/zed-console-log",
+        "arguments": ["--stdio"]
+      }
+    }
+  }
+}
+```
+
+Binary resolution is `binary.path`, then `zed-console-log` on the worktree's PATH, then the versioned download. Explicit arguments (including an empty list) and environment overrides are preserved. No Rust or Node.js installation is needed when using a release binary. Build prerequisites apply when developing the extension.
 
 Choose an insertion action for `console.log`, `info`, `debug`, `warn`, `error`, or `table`. Configuring `customFunction` also offers a custom logger action. `console.table` receives data directly, without a label argument.
 
@@ -48,7 +67,11 @@ const value = loadValue();
 
 Bulk actions comment, uncomment, delete, or correct generated labels. A nonempty selection restricts them to intersecting logs; an empty selection targets the document. Ownership uses the stable marker and parsed statement shape, independently of the display prefix. Ordinary application logs are preserved.
 
-The launcher uses your configured `binary.path`, or finds `zed-console-log` on the worktree's PATH. It does not download an unpublished package or modify your settings. Native and WebAssembly builds are validated separately; an interactive Zed smoke test remains part of the development checklist.
+To clean all registered workspace folders, leave the selection empty and choose **Delete generated logs in workspace…** from code actions (`Cmd+.` on macOS, `Ctrl+.` on Windows/Linux with the default keymap). Review the affected file paths and per-file log counts, then choose **Delete logs** or **Cancel**. The server sends a multi-file edit to the editor; it never writes files or saves buffers directly. Save the edited buffers afterward.
+
+Workspace cleanup scans existing `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, and `.cts` files. It respects `.gitignore`, `.ignore`, and Git exclude rules; skips symlinks and dependency/build directories (`node_modules`, `target`, `dist`, `build`, `coverage`, `.next`, `.nuxt`, `vendor`, `.git`); and uses unsaved open-buffer contents instead of disk. Files with invalid synchronization, invalid syntax, or unsafe deletion boundaries are skipped and reported. Files not yet created on disk, including untitled buffers, are outside the scan. Scans skip files over 4 MiB and stop entirely above 20,000 eligible files or 64 MiB of source. Any open-buffer or workspace-folder change invalidates the preview; changed closed-file contents are also checked before applying. The action requires a local workspace root and client support for applying versioned workspace edits.
+
+The language-server settings key and ownership marker remain `zed-console-log`, independently of the registry ID `debug-log-lsp`. Native and WebAssembly builds are validated separately; an interactive Zed smoke test of the submission commit remains part of the [publishing checklist](docs/publishing.md).
 
 ## Configuration
 
@@ -84,4 +107,4 @@ Unknown or invalid options are rejected. Invalid initialization options return a
 - The server uses open-buffer contents and versioned edits, with UTF-16 LSP positions. A malformed incremental update invalidates its snapshot until the buffer is reopened.
 - Actions do not run automatically on save. Workspace log trees, direct operation shortcuts, and multicursor parity are not implemented.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/architecture.md), [maintenance](docs/maintenance.md), and the current [HANDOFF.md](HANDOFF.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/architecture.md), [maintenance](docs/maintenance.md), and the [changelog](CHANGELOG.md).

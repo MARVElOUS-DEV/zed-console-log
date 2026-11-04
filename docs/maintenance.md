@@ -4,7 +4,7 @@ Version 0.1.0 is a development version. Long-term maintenance is a goal; no LTS 
 
 | Component | Current baseline |
 | --- | --- |
-| Rust | Workspace MSRV 1.92; locally validated with 1.95 |
+| Rust | Native workspace MSRV 1.92; WASM launcher MSRV 1.90 to match registry CI |
 | Native host | macOS Apple Silicon validated locally |
 | Additional hosts | Linux and Windows checks configured in CI; execution pending |
 | Zed extension API | Published crate 0.7.0 |

@@ -9,6 +9,7 @@
 - Add a Rust/WebAssembly Zed launcher with local binary overrides and settings forwarding.
 - Add version-pinned native server downloads with offline caching and interrupted-install recovery.
 - Prepare the `debug-log-lsp` registry manifest, extension-local MIT license, and six-platform GitHub Release workflow with verified archives and checksums.
+- Build the WASM launcher with the registry's Rust 1.90 toolchain, independently of the native server's Rust 1.92 minimum.
 - Add black-box protocol checks, CI, artifact packaging, and development documentation.
 
 This development version has not been published or interactively verified in Zed.

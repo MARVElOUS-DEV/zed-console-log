@@ -3,6 +3,16 @@
 The public source repository is <https://github.com/MARVElOUS-DEV/zed-console-log>.
 The registry ID is `debug-log-lsp`; the server name, settings key, executable, and ownership marker remain `zed-console-log`. The registry builds the WASM launcher from `extension/`; the native server is downloaded separately using Zed's API. `extension/LICENSE` must match the root MIT license.
 
+The registry currently pins Rust 1.90 for WASM builds. The launcher declares its own Rust 1.90 minimum; the native workspace still requires Rust 1.92 for Oxc. Both check and release workflows build the launcher with the registry toolchain. Reproduce that build from the repository root before updating the registry submodule:
+
+```sh
+rustup toolchain install 1.90.0 --profile minimal --target wasm32-wasip2
+cd extension
+cargo +1.90.0 build --target wasm32-wasip2 --release --locked --target-dir target
+```
+
+Keep this compatibility check aligned with the registry's [CI toolchain](https://github.com/zed-industries/extensions/blob/main/.github/workflows/ci.yml). Building only with a newer local toolchain can miss a registry compilation failure.
+
 ## Build and publish native assets
 
 Use GitHub CLI authenticated as an account with write access to the source repository. Keep the workspace Cargo version, extension manifest version, and release tag aligned. The launcher uses `v` followed by its Cargo version rather than the latest release.

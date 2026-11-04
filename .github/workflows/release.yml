@@ -25,10 +25,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: wasm32-wasip2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo build -p zed-console-log-extension --target wasm32-wasip2 --release --locked
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          targets: wasm32-wasip2
+      - name: Build WASM with the registry toolchain and output layout
+        working-directory: extension
+        run: |
+          cargo build --target wasm32-wasip2 --release --locked --target-dir target
+          test -s target/wasm32-wasip2/release/zed_console_log_extension.wasm
 
   native:
     needs: checks

@@ -3,7 +3,8 @@ publish = false
 name = "zed-console-log-extension"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# The Zed extension registry builds the WASM launcher with Rust 1.90.
+rust-version = "1.90"
 license.workspace = true
 
 [lib]
